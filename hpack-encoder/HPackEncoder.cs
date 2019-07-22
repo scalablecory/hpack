@@ -18,23 +18,40 @@ namespace hpack_encoder
         private Memory<byte> _buffer;
         private int _bufferConsumed;
 
-        private System.Net.Http.HPack.HPackDecoder _decoder = new System.Net.Http.HPack.HPackDecoder();
+        private System.Net.Http.HPack.DynamicTable _decoderDynamicTable;
+        private System.Net.Http.HPack.HPackDecoder _decoder;
 
         public int BytesWritten => _bufferConsumed;
         public Memory<byte> HeadersWritten => _buffer.Slice(0, _bufferConsumed);
 
-        public IEnumerable<TableEntry> DynamicTable => _dynamicTableMap.Keys;
-        public int DynamicTableCount => _dynamicTableMap.Count;
+        public int DynamicTableCount => _dynamicCount;
         public int DynamicTableSize => _dynamicSize;
+
+        public IEnumerable<TableEntry> DynamicTable
+        {
+            get
+            {
+                for (int i = 0; i < _dynamicCount; ++i)
+                {
+                    yield return _dynamicTable[MapDynamicIndexToArrayIndex(i)];
+                }
+            }
+        }
 
         public HPackEncoder(Memory<byte> buffer, int dynamicTableMaxSize = 4096)
         {
             _buffer = buffer;
             _dynamicMaxSize = dynamicTableMaxSize;
+
+            _decoderDynamicTable = new System.Net.Http.HPack.DynamicTable(dynamicTableMaxSize);
+            _decoder = new System.Net.Http.HPack.HPackDecoder(maxDynamicTableSize: dynamicTableMaxSize, maxResponseHeadersLength: int.MaxValue, _decoderDynamicTable);
         }
 
         public HPackEncoder Encode(string name, string value, HPackFlags flags = HPackFlags.None)
         {
+            if (name == null) throw new ArgumentNullException(nameof(name));
+            if (value == null) throw new ArgumentNullException(nameof(value));
+
             int index = 0;
 
             switch (flags & IndexingMask)
@@ -83,6 +100,23 @@ namespace hpack_encoder
         private HPackEncoder FinishWrite(int totalWritten)
         {
             _decoder.Decode(_buffer.Span.Slice(_bufferConsumed, totalWritten), false, (o, n, v) => { }, null);
+
+            Debug.Assert(this.DynamicTableCount == _decoderDynamicTable.Count);
+            Debug.Assert(this._dynamicMaxSize == _decoderDynamicTable.MaxSize);
+
+            for (int i = 0; i < _dynamicCount; ++i)
+            {
+                System.Net.Http.HPack.HeaderField f = _decoderDynamicTable[i];
+                string fName = Encoding.UTF8.GetString(f.Name);
+                string fValue = Encoding.UTF8.GetString(f.Value);
+
+                TableEntry e = _dynamicTable[MapDynamicIndexToArrayIndex(i)];
+                Debug.Assert(e.Name == fName);
+                Debug.Assert(e.Value == fValue);
+            }
+
+            Debug.Assert(this.DynamicTableSize == _decoderDynamicTable.Size);
+
             _bufferConsumed += totalWritten;
             return this;
         }
@@ -106,7 +140,7 @@ namespace hpack_encoder
                 return false;
             }
 
-            index = MapDynamicIndex(set.First());
+            index = MapArrayIndexToDynamicIndex(set.First());
             return true;
         }
 
@@ -123,18 +157,34 @@ namespace hpack_encoder
                 return false;
             }
 
-            index = MapDynamicIndex(set.First());
+            index = MapArrayIndexToDynamicIndex(set.First());
             return true;
         }
 
-        private int MapDynamicIndex(int arrayIdx)
+        private int MapDynamicIndexToArrayIndex(int dynamicIndex)
         {
-            arrayIdx -= _dynamicHead;
+            Debug.Assert(dynamicIndex < _dynamicCount);
 
-            if (arrayIdx < 0)
+            int arrayIndex = _dynamicHead - dynamicIndex;
+
+            if (arrayIndex < 0)
             {
-                arrayIdx = _dynamicCount + arrayIdx;
+                arrayIndex += _dynamicTable.Length;
             }
+
+            return arrayIndex;
+        }
+
+        private int MapArrayIndexToDynamicIndex(int arrayIdx)
+        {
+            Debug.Assert(arrayIdx < _dynamicTable.Length);
+
+            if (arrayIdx > _dynamicHead)
+            {
+                arrayIdx -= _dynamicTable.Length;
+            }
+
+            arrayIdx = _dynamicHead - arrayIdx;
 
             return arrayIdx + s_staticTable.Length + 1;
         }
@@ -148,32 +198,40 @@ namespace hpack_encoder
                 EnsureDynamicSpaceAvailable(entrySize);
             }
 
+            if(entry.DynamicSize > _dynamicMaxSize)
+            {
+                return;
+            }
+
             if (_dynamicCount == _dynamicTable.Length)
             {
                 ResizeDynamicTable();
             }
 
-            int insertIndex = (_dynamicHead + _dynamicCount) & (_dynamicTable.Length - 1);
-            _dynamicTable[insertIndex] = entry;
+            _dynamicHead = (_dynamicHead + 1) & (_dynamicTable.Length - 1);
+            _dynamicTable[_dynamicHead] = entry;
 
             _dynamicSize += entrySize;
             _dynamicCount++;
 
-            AddMapping(entry, insertIndex);
+            int dynamicIndex = MapArrayIndexToDynamicIndex(_dynamicHead);
+            Debug.Assert(dynamicIndex == s_staticTable.Length + 1);
+
+            AddMapping(entry, _dynamicHead);
         }
 
         private void ResizeDynamicTable()
         {
             var newEntries = new TableEntry[_dynamicCount * 2];
 
-            int countA = _dynamicCount - _dynamicHead;
-            int countB = _dynamicCount - countA;
+            int headCount = _dynamicHead + 1;
+            int tailCount = _dynamicCount - headCount;
 
-            Array.Copy(_dynamicTable, _dynamicHead, newEntries, 0, countA);
-            Array.Copy(_dynamicTable, 0, newEntries, countA, countB);
+            Array.Copy(_dynamicTable, _dynamicHead+1, newEntries, 0, tailCount);
+            Array.Copy(_dynamicTable, 0, newEntries, tailCount, headCount);
 
             _dynamicTable = newEntries;
-            _dynamicHead = 0;
+            _dynamicHead = _dynamicCount - 1;
 
             _dynamicTableMap.Clear();
 
@@ -195,12 +253,23 @@ namespace hpack_encoder
             if (entry.Value.Length != 0)
             {
                 entry = new TableEntry(entry.Name, "");
-                if (!_dynamicTableMap.TryGetValue(entry, out set))
-                {
-                    set = new HashSet<int>();
-                    _dynamicTableMap.Add(entry, set);
-                }
-                set.Add(index);
+                AddMapping(entry, index);
+            }
+        }
+
+        private void RemoveMapping(TableEntry entry, int index)
+        {
+            HashSet<int> set = _dynamicTableMap[entry];
+            set.Remove(index);
+
+            if (set.Count == 0)
+            {
+                _dynamicTableMap.Remove(entry);
+            }
+
+            if (entry.Value.Length != 0)
+            {
+                RemoveMapping(new TableEntry(entry.Name, ""), index);
             }
         }
 
@@ -212,25 +281,20 @@ namespace hpack_encoder
             do
             {
                 Console.WriteLine($"Evicting from {_dynamicSize}");
-                ref TableEntry e = ref _dynamicTable[_dynamicHead];
 
-                HashSet<int> set = _dynamicTableMap[e];
-                set.Remove(_dynamicHead);
-                if (set.Count == 0) _dynamicTableMap.Remove(e);
+                int evictIdx = _dynamicHead - _dynamicCount + 1;
 
-                if (e.Value.Length != 0)
+                if (evictIdx < 0)
                 {
-                    TableEntry nameEntry = new TableEntry(e.Name, "");
-                    set = _dynamicTableMap[nameEntry];
-                    set.Remove(_dynamicHead);
-                    if (set.Count == 0) _dynamicTableMap.Remove(nameEntry);
+                    evictIdx += _dynamicTable.Length;
                 }
 
+                ref TableEntry e = ref _dynamicTable[evictIdx];
+                RemoveMapping(e, evictIdx);
+
+                _dynamicCount--;
                 _dynamicSize -= e.DynamicSize;
                 e = default;
-
-                _dynamicHead = (_dynamicHead + 1) & (_dynamicTable.Length - 1);
-                _dynamicCount--;
             }
             while ((_dynamicMaxSize - _dynamicSize) < size);
         }
@@ -473,12 +537,13 @@ namespace hpack_encoder
 
             public string Name { get; }
             public string Value { get; }
-            public int DynamicSize => Name.Length + Value.Length + DynamicOverhead;
+            public int DynamicSize { get; }
 
             public TableEntry(string name, string value)
             {
                 Name = name;
                 Value = value;
+                DynamicSize = Encoding.UTF8.GetByteCount(name) + Encoding.UTF8.GetByteCount(value) + DynamicOverhead;
             }
 
             public int CompareTo(TableEntry other)

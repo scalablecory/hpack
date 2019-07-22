@@ -45,7 +45,8 @@ namespace hpack_encoder
                         string name, value;
                         HPackFlags flags = HPackFlags.None;
 
-                        switch (rng.Next(5))
+                        int type = rng.Next(5);
+                        switch (type)
                         {
                             case 0:
                                 Console.WriteLine("fully indexed, static.");
@@ -67,12 +68,12 @@ namespace hpack_encoder
                                     (name, value) = (e.Name, e.Value);
                                 }
                                 break;
-                            case 2: // indexed name, static.
+                            case 2:
                                 Console.WriteLine("indexed name, static.");
                                 name = staticIndexedNames[rng.Next(staticIndexedNames.Length)];
                                 value = GenerateValue();
                                 break;
-                            case 3: // indexed name, dynamic.
+                            case 3:
                                 if (enc.DynamicTableCount == 0 || rng.Next(5) == 0)
                                 {
                                     Console.WriteLine("new dynamic index.");
@@ -96,6 +97,9 @@ namespace hpack_encoder
                             default:
                                 throw new Exception("should never be reached A");
                         }
+
+                        Debug.Assert(name != null);
+                        Debug.Assert(value != null);
 
                         if (flags != HPackFlags.NewIndexed)
                         {
@@ -146,7 +150,7 @@ namespace hpack_encoder
         static void GenerateSeed(EncodeSeedDelegate encodeFunc)
         {
             byte[] buffer = new byte[1024*1024];
-            var encoder = new HPackEncoder(buffer, 1024);
+            var encoder = new HPackEncoder(buffer);
 
             encodeFunc(encoder);
             encoder.VerifyComplete();
